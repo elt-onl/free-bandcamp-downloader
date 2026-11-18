@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import struct
 import threading
 import time
 import zipfile
@@ -13,11 +14,12 @@ import requests
 
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.cookiejar import MozillaCookieJar
 from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
 from urllib.parse import urljoin
 from email.utils import parseaddr, parsedate_to_datetime
+from mutagen.flac import Picture
 from urllib3 import Retry
 
 from free_bandcamp_downloader import logger
@@ -67,6 +69,16 @@ class BCFreeDownloaderOptions:
     dir: str = "."
     cookies: Optional[str] = None
     identity: Optional[str] = None
+    # album, album artist, track/disc numbers and totals, release type
+    release_tags: bool = False
+    # fill `artists` by splitting `artist` on artist_separators
+    split_artists: bool = False
+    # space separated; words need whitespace around them, symbols don't
+    artist_separators: str = "feat. , & x and"
+    # embed the original-resolution cover instead of Bandcamp's 700px one (FLAC)
+    cover_original: bool = False
+    # fixed tags as "key=value", applied last
+    tag: List[str] = field(default_factory=list)
 
 
 class BCFreeDownloadError(Exception):
@@ -185,14 +197,26 @@ class BCFreeDownloader:
         os.remove(file_name)
         return glob.glob(os.path.join(dir_name, "*"))
 
-    # Tag downloaded audio file with url, release date & comment
-    @staticmethod
-    def tag_file(file_name: str, head_data: Dict):
-        try:
-            f = mutagen.File(file_name)
-            if f is None:
-                return
+    # Tag downloaded audio files with url, release date, comment and the
+    # tags enabled in options
+    def tag_files(self, file_names: List[str], album_info: AlbumInfo):
+        cover = None
+        if self.options.cover_original:
+            try:
+                cover = self._get_original_cover(album_info["tralbum_data"])
+            except requests.RequestException as ex:
+                logger.warning(f"Could not download the original cover: {ex}")
+        for file_name in file_names:
+            self._tag_file(file_name, album_info, cover)
 
+    def _tag_file(
+        self, file_name: str, album_info: AlbumInfo, cover: Optional[Picture]
+    ):
+        head_data = album_info["head_data"]
+        f = mutagen.File(file_name)
+        if f is None:
+            return
+        try:
             f["website"] = head_data["@id"]
             if head_data.get("keywords"):
                 f["genre"] = head_data["keywords"]
@@ -205,10 +229,77 @@ class BCFreeDownloader:
             comment += head_data.get("description", "").strip()
             comment += "\n\n" + head_data.get("creditText", "")
             f["comment"] = comment.strip()
+            if self.options.release_tags:
+                self._set_release_tags(f, album_info["tralbum_data"])
+            for tag in self.options.tag:
+                key, _, value = tag.partition("=")
+                f[key.strip()] = value
+            if cover is not None and hasattr(f, "add_picture"):
+                f.clear_pictures()
+                f.add_picture(cover)
             f.save()
-        except Exception:
-            # only should happen if the file doesn't support tags
-            pass
+        except Exception as ex:
+            # only should happen if the file doesn't support these tags
+            logger.warning(f"Could not tag {file_name}: {ex!r}")
+
+    def _set_release_tags(self, f, tralbum_data: Dict):
+        artist = f.get("artist", [tralbum_data["artist"]])[0]
+        # the page type decides: a /track/ page is a single, even when the
+        # track is part of an album
+        if tralbum_data["item_type"] == "track":
+            f["album"] = f.get("title", [tralbum_data["current"]["title"]])[0]
+            f["albumartist"] = artist
+            f["tracknumber"] = "1"
+            f["releasetype"] = "single"
+        else:
+            f.setdefault("album", [tralbum_data["current"]["title"]])
+            f.setdefault("albumartist", [tralbum_data["artist"]])
+            f["releasetype"] = "album"
+        total_tracks = str(len(tralbum_data["trackinfo"]))
+        f["albumartistsort"] = f["albumartist"]
+        f["artists"] = (
+            self._split_artists(artist) if self.options.split_artists else [artist]
+        )
+        f["artistsort"] = artist
+        f["totaltracks"] = f["tracktotal"] = total_tracks
+        f["discnumber"] = "1"
+        f["totaldiscs"] = f["disctotal"] = "1"
+
+    def _split_artists(self, artist: str) -> List[str]:
+        patterns = []
+        for separator in self.options.artist_separators.split():
+            space = r"\s+" if any(c.isalnum() for c in separator) else r"\s*"
+            patterns.append(space + re.escape(separator) + space)
+        if not patterns:
+            return [artist]
+        names = re.split("|".join(patterns), artist, flags=re.IGNORECASE)
+        return list(dict.fromkeys(name.strip() for name in names if name.strip()))
+
+    def _get_original_cover(self, tralbum_data: Dict) -> Picture:
+        # _0 is the uploaded original; the extension in the URL is ignored
+        url = f"https://f4.bcbits.com/img/a{tralbum_data['art_id']:010d}_0.jpg"
+        r = self.get_url(url)
+        cover = Picture()
+        cover.type = 3  # front cover
+        cover.mime = r.headers.get("content-type", "image/jpeg")
+        cover.data = r.content
+        cover.width, cover.height = self._image_size(r.content)
+        return cover
+
+    @staticmethod
+    def _image_size(data: bytes) -> Tuple[int, int]:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return struct.unpack(">II", data[16:24])
+        if data[:2] == b"\xff\xd8":
+            # walk JPEG segments to the start-of-frame, which holds the size
+            i = 2
+            while i + 9 <= len(data) and data[i] == 0xFF:
+                marker = data[i + 1]
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    height, width = struct.unpack(">HH", data[i + 5 : i + 9])
+                    return width, height
+                i += 2 + struct.unpack(">H", data[i + 2 : i + 4])[0]
+        return 0, 0
 
     def _download_purchased_album(
         self, user_id: int, tralbum_data: Dict

@@ -1,24 +1,21 @@
 """Download free albums and tracks from Bandcamp
 
 Usage:
-    bcdl-free setdefault [-d <dir>] [-e <email>] [-z <zipcode>]
-        [-c <country>] [-f <format>]
     bcdl-free defaults
     bcdl-free clear
-    bcdl-free [--debug] [--force] [--no-unzip] [-al]
-        [-d <dir>] [-e <email>] [-z <zipcode>] [-c <country>] [-f <format>]
-        [--cookies <file>] [--identity <value>] URL...
     bcdl-free -h | --help | --version
     bcdl-free [--debug] [--force] [--no-unzip] [-al]
         [-d <dir>] [-e <email>] [-z <zipcode>] [-c <country>] [-f <format>]
         [--cookies <file>] [--identity <value>] [--download-history-file <file>]
-        URL...
+        [--release-tags] [--split-artists] [--artist-separators <separators>]
+        [--cover-original] [--tag <tag>]...
+        (setdefault | URL...)
 
 Arguments:
     URL            URL to download. Can be a link to a label or release page
 
 Subcommands:
-    setdefaults    set default configuration options
+    setdefault     save the given options as defaults for later downloads
     defaults       list default configuration options
     clear          clear default configuration options
 
@@ -37,6 +34,16 @@ Options:
     --cookies <file>                     Path to cookies.txt file so albums in your collection can be downloaded
     --identity <value>                   Value of identity cookie so albums in your collection can be downloaded
     --download-history-file <file>       Path to history file containing downloaded albums
+
+Tagging options:
+    --release-tags                       Tag album, albumartist(sort), artistsort, track and disc numbers with
+                                         totals, and releasetype: single for track URLs, album for album URLs
+    --split-artists                      Fill the artists tag by splitting artist on the separators
+    --artist-separators <separators>     Space separated; words need spaces around them, symbols don't
+                                         (default: "feat. , & x and")
+    --cover-original                     Embed the original-resolution cover instead of Bandcamp's 700px one (FLAC)
+    --tag <tag>                          Set a fixed tag as key=value, e.g. --tag "media=Digital Media".
+                                         Repeatable; applied last, so it overrides other tags
 
 Formats:
     - FLAC
@@ -75,8 +82,9 @@ class Config:
         # this is combined from the dataclass and CLI params
         self.parser = ConfigParser(allow_no_value=True)
         self.parser["free-bandcamp-downloader"] = {}
-        for field in dataclasses.fields(BCFreeDownloaderOptions):
-            self.parser["free-bandcamp-downloader"][field.name] = field.default
+        defaults = BCFreeDownloaderOptions()
+        for field in dataclasses.fields(defaults):
+            self.set(field.name, getattr(defaults, field.name))
         self.parser["free-bandcamp-downloader"]["force"] = "false"
         self.parser["free-bandcamp-downloader"]["no-unzip"] = "false"
         self.parser["free-bandcamp-downloader"]["download-history-file"] = (
@@ -95,7 +103,9 @@ class Config:
         return self.parser["free-bandcamp-downloader"].get(key)
 
     def set(self, key, value):
-        if value is not None:
+        if isinstance(value, list):
+            value = "\n".join(value)
+        elif value is not None:
             value = str(value)
         self.parser["free-bandcamp-downloader"][key] = value
 
@@ -109,10 +119,17 @@ class Config:
 
 def options_from_config(config: Config):
     options = BCFreeDownloaderOptions()
+    section = config.parser["free-bandcamp-downloader"]
     for field in dataclasses.fields(options):
-        setattr(
-            options, field.name, config.parser["free-bandcamp-downloader"][field.name]
-        )
+        # convert back to the type of the default value
+        default = getattr(options, field.name)
+        if isinstance(default, bool):
+            value = section.getboolean(field.name)
+        elif isinstance(default, list):
+            value = (section[field.name] or "").splitlines()
+        else:
+            value = section[field.name]
+        setattr(options, field.name, value)
     return options
 
 
@@ -175,7 +192,7 @@ def get_downloaded(config: Config) -> Set[TralbumId]:
     return downloaded
 
 
-def post_download(album_info: AlbumInfo, config: Config):
+def post_download(downloader: BCFreeDownloader, album_info: AlbumInfo, config: Config):
     file_name = album_info["file_name"]
     # file list for setting tags
     files = [file_name]
@@ -186,8 +203,7 @@ def post_download(album_info: AlbumInfo, config: Config):
         files = BCFreeDownloader.unzip_album(file_name)
 
     logger.info("Setting tags...")
-    for file in files:
-        BCFreeDownloader.tag_file(file, album_info["head_data"])
+    downloader.tag_files(files, album_info)
 
 
 def download_urls(urls: List[str], config: Config):
@@ -214,7 +230,7 @@ def download_urls(urls: List[str], config: Config):
             if ret["is_downloaded"]:
                 add_to_dl_file(config, (type, id))
                 downloaded.add((type, id))
-                post_download(ret, config)
+                post_download(downloader, ret, config)
         elif urltype == "band":
             for rel in url_info["info"]["releases"]:
                 type = rel["type"]
@@ -230,7 +246,7 @@ def download_urls(urls: List[str], config: Config):
                 if ret["is_downloaded"]:
                     add_to_dl_file(config, (type, id))
                     downloaded.add((type, id))
-                    post_download(ret, config)
+                    post_download(downloader, ret, config)
         else:
             continue
 
@@ -241,7 +257,7 @@ def download_urls(urls: List[str], config: Config):
         id = album_info["tralbum_data"]["current"]["id"]
         add_to_dl_file(config, (type, id))
         downloaded.add((type, id))
-        post_download(album_info, config)
+        post_download(downloader, album_info, config)
 
 
 def main():
@@ -254,9 +270,14 @@ def main():
     # set config if needed
     if arguments["URL"] or arguments["setdefault"]:
         for option in config.parser["free-bandcamp-downloader"].keys():
-            arg = f"--{option}"
+            arg = f"--{option.replace('_', '-')}"
             if arguments.get(arg):
                 config.set(option, arguments[arg])
+        for tag in config.get("tag").splitlines():
+            key, sep, _ = tag.partition("=")
+            if not sep or not key.strip():
+                logger.error(f'--tag "{tag}" is not in key=value form')
+                sys.exit(1)
         if (
             config.parser["free-bandcamp-downloader"]["format"]
             not in BCFreeDownloader.FORMATS
