@@ -1,22 +1,25 @@
 # free-bandcamp-downloader
 
+This is a self-maintained fork of [7x11x13/free-bandcamp-downloader](https://github.com/7x11x13/free-bandcamp-downloader).
+
 Download free and $0 minimum name-your-price albums and tracks from Bandcamp (including ones that are sent to email),
 and tag them with data from the Bandcamp page. Also able to download items in your collection, if login cookies are
 supplied using the `--cookies` or `--identity` argument.
 
 ## Installation
 
-With pip:
-
-```
-$ pip install free-bandcamp-downloader
-$ bcdl-free
-```
-
 With [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```
-$ uvx --from free-bandcamp-downloader bcdl-free
+$ uv tool install git+https://github.com/elt-onl/free-bandcamp-downloader
+$ bcdl-free
+```
+
+With pip:
+
+```
+$ pip install git+https://github.com/elt-onl/free-bandcamp-downloader
+$ bcdl-free
 ```
 
 ## Note on email downloads
