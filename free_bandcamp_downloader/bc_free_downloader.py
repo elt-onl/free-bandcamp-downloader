@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from typing import Dict, List, Literal, Optional, Tuple, TypedDict, Union
 from urllib.parse import urljoin
+from email.utils import parseaddr
 from guerrillamail import GuerrillaMailSession
 from urllib3 import Retry
 
@@ -341,10 +342,7 @@ class BCFreeDownloader:
                     continue
 
                 checked_ids.add(email_id)
-                if (
-                    email.sender == "noreply@bandcamp.com"
-                    and "download" in email.subject
-                ):
+                if self._is_bandcamp_download_email(email.sender, email.subject):
                     logger.info(f'Received email "{email.subject}"')
                     content = self.mail_session.get_email(email_id).body
                     match = self.LINK_REGEX.search(content)
@@ -359,6 +357,16 @@ class BCFreeDownloader:
                     else:
                         logger.error(f"Could not find download URL in body: {content}")
         return downloaded
+
+    # Bandcamp has sent these from noreply@bandcamp.com and from per-message
+    # bounce addresses like bounces+<id>-<hash>-<recipient>@email.bandcamp.com
+    @staticmethod
+    def _is_bandcamp_download_email(
+        sender: Optional[str], subject: Optional[str]
+    ) -> bool:
+        domain = parseaddr(sender or "")[1].rpartition("@")[2].lower()
+        from_bandcamp = domain == "bandcamp.com" or domain.endswith(".bandcamp.com")
+        return from_bandcamp and "download" in (subject or "").lower()
 
     # get_url_x can't be staticmethods because of special session context
     def get_url(self, url: str, **kwargs) -> requests.Response:
