@@ -19,6 +19,12 @@ With [uv](https://docs.astral.sh/uv/getting-started/installation/):
 $ uvx --from free-bandcamp-downloader bcdl-free
 ```
 
+## Note on email downloads
+
+Releases that are only sent by email are received through a disposable inbox from [mail.tm](https://mail.tm),
+unless `--email` is set to your own address. In that case the download links are sent to you and nothing is
+downloaded for those releases.
+
 ## Note on passing cookies
 
 Only one cookie is needed to login, which has the name "identity". You can pass this cookie to `bcdl-free` using the

@@ -2,7 +2,9 @@ import glob
 import html
 import json
 import os
+import queue
 import re
+import threading
 import time
 import zipfile
 import mutagen
@@ -13,14 +15,14 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
-from typing import Dict, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
 from urllib.parse import urljoin
 from email.utils import parseaddr
-from guerrillamail import GuerrillaMailSession
 from urllib3 import Retry
 
 from free_bandcamp_downloader import logger
 from free_bandcamp_downloader.bandcamp_http_adapter import BandcampHTTPAdapter
+from free_bandcamp_downloader.mail_tm import MailTmSession
 
 TralbumId = Tuple[Literal["album", "track", "url"], Union[int, str]]
 
@@ -73,7 +75,7 @@ class BCFreeDownloadError(Exception):
 
 class BCFreeDownloader:
     CHUNK_SIZE = 1024 * 1024
-    LINK_REGEX = re.compile(r'<a href="(?P<url>[^"]*)">')
+    DOWNLOAD_LINK_REGEX = re.compile(r"https://bandcamp\.com/download\?[^\s\"'<>]+")
     RETRY_URL_REGEX = re.compile(r'"retry_url":"(?P<retry_url>[^"]*)"')
     FORMATS = {
         "FLAC": "flac",
@@ -85,10 +87,21 @@ class BCFreeDownloader:
         "WAV": "wav",
         "AIFF": "aiff-lossless",
     }
+    # seconds between inbox checks
+    MAIL_POLL_INTERVAL = 5
+    # seconds without a new download email before the missing ones are re-requested
+    EMAIL_TIMEOUT = 120
+    # re-requests before giving up on the missing emails
+    MAX_EMAIL_RESENDS = 2
 
     def __init__(self, options: BCFreeDownloaderOptions):
         self.options = options
-        self.mail_session = None
+        self.mail_session: Optional[MailTmSession] = None
+        self._mail_poller: Optional[threading.Thread] = None
+        self._mail_stop = threading.Event()
+        # download page links found in Bandcamp emails, filled by the mail poller
+        self._download_links: "queue.Queue[str]" = queue.Queue()
+        self._seen_mail_ids: Set[str] = set()
         self.queued_emails: Dict[TralbumId, AlbumInfo] = {}
         self.session = None
         self.email = None
@@ -99,8 +112,8 @@ class BCFreeDownloader:
         if not self.options.email:
             self.options.email = "auto"
         if self.options.email == "auto":
-            self.mail_session = GuerrillaMailSession()
-            self.options.email = self.mail_session.get_session_state()["email_address"]
+            self.mail_session = MailTmSession()
+            self.options.email = self.mail_session.address
 
     def _init_session(self):
         self.session = requests.Session()
@@ -116,13 +129,20 @@ class BCFreeDownloader:
             self.session.cookies.set("identity", self.options.identity)
 
     def _download_file(self, download_page_url: str, format: str) -> DownloadRet:
-        soup = self.get_url_soup(download_page_url)
+        id, item = self._get_digital_item(download_page_url)
+        return self._download_digital_item(id, item, format)
 
-        data = json.loads(soup.find("div", {"id": "pagedata"}).attrs["data-blob"])[
+    def _get_digital_item(self, download_page_url: str) -> Tuple[TralbumId, Dict]:
+        soup = self.get_url_soup(download_page_url)
+        item = json.loads(soup.find("div", {"id": "pagedata"}).attrs["data-blob"])[
             "digital_items"
         ][0]
-        download_url = data["downloads"][self.FORMATS[format]]["url"]
-        id = (data["type"], int(data["item_id"]))
+        return (item["type"], int(item["item_id"])), item
+
+    def _download_digital_item(
+        self, id: TralbumId, item: Dict, format: str
+    ) -> DownloadRet:
+        download_url = item["downloads"][self.FORMATS[format]]["url"]
 
         def download(download_url: str) -> str:
             with self.get_url(download_url, stream=True) as r:
@@ -254,25 +274,12 @@ class BCFreeDownloader:
             logger.info(f"{url} requires email")
             if self.mail_session is None:
                 self._init_email()
-            email_post_url = urljoin(url, "/email_download")
-            r = self.post_url_json(
-                email_post_url,
-                data={
-                    "encoding_name": "none",
-                    "item_id": tralbum_data["current"]["id"],
-                    "item_type": tralbum_data["current"]["type"],
-                    "address": self.options.email,
-                    "country": self.options.country,
-                    "postcode": self.options.zipcode,
-                },
-            )
-
-            if not r["ok"]:
-                raise ValueError(f"Bad response when sending email address: {r}")
+            self._request_email_download(tralbum_data)
             type = tralbum_data["current"]["type"]
             id = tralbum_data["current"]["id"]
             album_data["email_queued"] = True
             self.queued_emails[(type, id)] = album_data
+            self._start_mail_poller()
             return album_data
         elif tralbum_data["is_purchased"]:
             collection_info = soup.find(
@@ -328,38 +335,121 @@ class BCFreeDownloader:
 
         return ret
 
+    def _request_email_download(self, tralbum_data: Dict):
+        r = self.post_url_json(
+            urljoin(tralbum_data["url"], "/email_download"),
+            data={
+                "encoding_name": "none",
+                "item_id": tralbum_data["current"]["id"],
+                "item_type": tralbum_data["current"]["type"],
+                "address": self.options.email,
+                "country": self.options.country,
+                "postcode": self.options.zipcode,
+            },
+        )
+        if not r["ok"]:
+            raise ValueError(f"Bad response when sending email address: {r}")
+
+    # Read the inbox from the first queued email on, instead of only in
+    # flush_email_downloads, so links are collected while other releases download.
+    def _start_mail_poller(self):
+        if self.mail_session is None or (
+            self._mail_poller is not None and self._mail_poller.is_alive()
+        ):
+            return
+        # a fresh event, so a poller that is still finishing a request after
+        # being stopped can't be revived by this one
+        self._mail_stop = threading.Event()
+        self._mail_poller = threading.Thread(
+            target=self._poll_mail, args=(self._mail_stop,), daemon=True
+        )
+        self._mail_poller.start()
+
+    def _poll_mail(self, stop: threading.Event):
+        while not stop.wait(self.MAIL_POLL_INTERVAL):
+            try:
+                self._check_mail()
+            except (requests.RequestException, KeyError, ValueError) as ex:
+                logger.warning(f"Checking mail failed, retrying: {ex!r}")
+
+    def _check_mail(self):
+        for message in self.mail_session.get_messages():
+            message_id = message["id"]
+            if message_id in self._seen_mail_ids:
+                continue
+            subject = message["subject"]
+            if self._is_bandcamp_download_email(message["from"]["address"], subject):
+                logger.debug(f'Received email "{subject}"')
+                full = self.mail_session.get_message(message_id)
+                body = (full.get("text") or "") + "".join(full.get("html") or [])
+                match = self.DOWNLOAD_LINK_REGEX.search(body)
+                if match:
+                    self._download_links.put(html.unescape(match.group()))
+                else:
+                    logger.error(f'Could not find download URL in email "{subject}"')
+            self._seen_mail_ids.add(message_id)
+            self.mail_session.delete_message(message_id)
+
     def flush_email_downloads(self) -> List[AlbumInfo]:
-        checked_ids = set()
         downloaded = []
-        while len(self.queued_emails) > 0:
+        if not self.queued_emails:
+            return downloaded
+        if self.mail_session is None:
             logger.info(
-                f"Waiting for {len(self.queued_emails)} emails from Bandcamp..."
+                f"Download links for {len(self.queued_emails)} releases "
+                f"were sent to {self.options.email}"
             )
-            time.sleep(5)
-            for email in self.mail_session.get_email_list():
-                email_id = email.guid
-                if email_id in checked_ids:
+            self.queued_emails.clear()
+            return downloaded
+
+        resends = 0
+        last_progress = time.monotonic()
+        try:
+            while self.queued_emails:
+                logger.info(
+                    f"Waiting for {len(self.queued_emails)} emails from Bandcamp..."
+                )
+                try:
+                    link = self._download_links.get(timeout=self.MAIL_POLL_INTERVAL)
+                except queue.Empty:
+                    if time.monotonic() - last_progress < self.EMAIL_TIMEOUT:
+                        continue
+                    if resends == self.MAX_EMAIL_RESENDS:
+                        for album_data in self.queued_emails.values():
+                            logger.error(
+                                "No download email arrived for "
+                                f"{album_data['tralbum_data']['url']}"
+                            )
+                        self.queued_emails.clear()
+                        break
+                    resends += 1
+                    logger.info(
+                        f"Requesting {len(self.queued_emails)} missing emails again "
+                        f"({resends}/{self.MAX_EMAIL_RESENDS})..."
+                    )
+                    for album_data in self.queued_emails.values():
+                        self._request_email_download(album_data["tralbum_data"])
+                    last_progress = time.monotonic()
                     continue
 
-                checked_ids.add(email_id)
-                if self._is_bandcamp_download_email(email.sender, email.subject):
-                    logger.info(f'Received email "{email.subject}"')
-                    content = self.mail_session.get_email(email_id).body
-                    match = self.LINK_REGEX.search(content)
-                    if match:
-                        download_url = match.group("url")
-                        dlret = self._download_file(download_url, self.options.format)
-                        self.queued_emails[dlret["id"]]["file_name"] = dlret[
-                            "file_name"
-                        ]
-                        downloaded.append(self.queued_emails[dlret["id"]])
-                        self.queued_emails.pop(dlret["id"])
-                    else:
-                        logger.error(f"Could not find download URL in body: {content}")
+                # look the item up before downloading: re-requests can produce
+                # several emails for one release
+                id, item = self._get_digital_item(link)
+                album_data = self.queued_emails.pop(id, None)
+                if album_data is None:
+                    logger.debug(f"Skipping email for {id}, not queued")
+                    continue
+                dlret = self._download_digital_item(id, item, self.options.format)
+                album_data["file_name"] = dlret["file_name"]
+                downloaded.append(album_data)
+                last_progress = time.monotonic()
+        finally:
+            self._mail_stop.set()
         return downloaded
 
-    # Bandcamp has sent these from noreply@bandcamp.com and from per-message
-    # bounce addresses like bounces+<id>-<hash>-<recipient>@email.bandcamp.com
+    # Match the domain rather than one address: the sender can be
+    # noreply@bandcamp.com or a per-message bounce address such as
+    # bounces+<id>-<hash>-<recipient>@email.bandcamp.com
     @staticmethod
     def _is_bandcamp_download_email(
         sender: Optional[str], subject: Optional[str]

@@ -204,20 +204,6 @@ files = [
 pyparsing = ">=3.0.7,<3.1.0"
 
 [[package]]
-name = "python-guerrillamail"
-version = "0.2.0"
-description = "Client for the Guerrillamail temporary email server"
-optional = false
-python-versions = "*"
-files = [
-    {file = "python-guerrillamail-0.2.0.tar.gz", hash = "sha256:f04c48c58ddc55f81c2fe63c43e5f8d806ea77695fc621fe8bdbc11413bf9e31"},
-    {file = "python_guerrillamail-0.2.0-py2.py3-none-any.whl", hash = "sha256:993934d09cdba4c0f8a70b00eedf3563acabdec3e24bb82335121a0e022afff5"},
-]
-
-[package.dependencies]
-requests = "*"
-
-[[package]]
 name = "requests"
 version = "2.32.3"
 description = "Python HTTP for Humans."
@@ -289,4 +275,4 @@ zstd = ["zstandard (>=0.18.0)"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.8"
-content-hash = "85da27e91df1a1842bad13ae922fb9d9f63d82795c8665a3aeb91a7be43a0d8c"
+content-hash = "7a9d739f6f376d4de60aa2674cfbb9a88f15df2af198a0aed830caa3a4da1788"
