@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
 from urllib.parse import urljoin
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from urllib3 import Retry
 
 from free_bandcamp_downloader import logger
@@ -185,7 +185,7 @@ class BCFreeDownloader:
         os.remove(file_name)
         return glob.glob(os.path.join(dir_name, "*"))
 
-    # Tag downloaded audio file with url & comment
+    # Tag downloaded audio file with url, release date & comment
     @staticmethod
     def tag_file(file_name: str, head_data: Dict):
         try:
@@ -196,6 +196,11 @@ class BCFreeDownloader:
             f["website"] = head_data["@id"]
             if head_data.get("keywords"):
                 f["genre"] = head_data["keywords"]
+            if head_data.get("datePublished"):
+                # Bandcamp only writes the year; datePublished is the release
+                # date, e.g. "03 Oct 2026 00:00:00 GMT"
+                released = parsedate_to_datetime(head_data["datePublished"])
+                f["date"] = released.date().isoformat()
             comment = ""
             comment += head_data.get("description", "").strip()
             comment += "\n\n" + head_data.get("creditText", "")
