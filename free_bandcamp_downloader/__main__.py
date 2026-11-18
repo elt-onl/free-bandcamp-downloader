@@ -36,9 +36,9 @@ Options:
     --download-history-file <file>       Path to history file containing downloaded albums
 
 Tagging options:
-    --release-tags                       Tag album, albumartist(sort), artistsort, track and disc numbers with
-                                         totals, and releasetype: single for track URLs, album for album URLs
-    --split-artists                      Fill the artists tag by splitting artist on the separators
+    --release-tags                       Tag album, albumartist(sort), artists, artistsort, track and disc numbers
+                                         with totals, and releasetype: single for track URLs, album for album URLs
+    --split-artists                      With --release-tags, split the artists tag on the separators
     --artist-separators <separators>     Space separated; words need spaces around them, symbols don't
                                          (default: "feat. , & x and")
     --cover-original                     Embed the original-resolution cover instead of Bandcamp's 700px one (FLAC)
