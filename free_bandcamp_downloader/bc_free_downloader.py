@@ -99,8 +99,8 @@ class BCFreeDownloader:
         self.mail_session: Optional[MailTmSession] = None
         self._mail_poller: Optional[threading.Thread] = None
         self._mail_stop = threading.Event()
-        # download page links found in Bandcamp emails, filled by the mail poller
-        self._download_links: "queue.Queue[str]" = queue.Queue()
+        # (subject, download page link) of Bandcamp emails, filled by the mail poller
+        self._download_links: "queue.Queue[Tuple[str, str]]" = queue.Queue()
         self._seen_mail_ids: Set[str] = set()
         self.queued_emails: Dict[TralbumId, AlbumInfo] = {}
         self.session = None
@@ -379,12 +379,12 @@ class BCFreeDownloader:
                 continue
             subject = message["subject"]
             if self._is_bandcamp_download_email(message["from"]["address"], subject):
-                logger.debug(f'Received email "{subject}"')
                 full = self.mail_session.get_message(message_id)
                 body = (full.get("text") or "") + "".join(full.get("html") or [])
                 match = self.DOWNLOAD_LINK_REGEX.search(body)
                 if match:
-                    self._download_links.put(html.unescape(match.group()))
+                    link = html.unescape(match.group())
+                    self._download_links.put((subject, link))
                 else:
                     logger.error(f'Could not find download URL in email "{subject}"')
             self._seen_mail_ids.add(message_id)
@@ -410,7 +410,9 @@ class BCFreeDownloader:
                     f"Waiting for {len(self.queued_emails)} emails from Bandcamp..."
                 )
                 try:
-                    link = self._download_links.get(timeout=self.MAIL_POLL_INTERVAL)
+                    subject, link = self._download_links.get(
+                        timeout=self.MAIL_POLL_INTERVAL
+                    )
                 except queue.Empty:
                     if time.monotonic() - last_progress < self.EMAIL_TIMEOUT:
                         continue
@@ -432,6 +434,7 @@ class BCFreeDownloader:
                     last_progress = time.monotonic()
                     continue
 
+                logger.info(f'Received email "{subject}"')
                 # look the item up before downloading: re-requests can produce
                 # several emails for one release
                 id, item = self._get_digital_item(link)
