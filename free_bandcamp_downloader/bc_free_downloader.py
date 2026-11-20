@@ -22,7 +22,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 from mutagen.flac import Picture
 from urllib3 import Retry
 
-from free_bandcamp_downloader import logger
+from free_bandcamp_downloader import __version__, logger
 from free_bandcamp_downloader.bandcamp_http_adapter import BandcampHTTPAdapter
 from free_bandcamp_downloader.mail_tm import MailTmSession
 
@@ -129,6 +129,14 @@ class BCFreeDownloader:
 
     def _init_session(self):
         self.session = requests.Session()
+        # Bandcamp redirects non-browser clients from an artist's *.bandcamp.com
+        # page to their custom domain, which redirects straight back: an endless
+        # loop. User agents containing "bot" get the page directly. A browser
+        # user agent doesn't work: requests' TLS fingerprint gets a JS challenge.
+        self.session.headers["User-Agent"] = (
+            f"free-bandcamp-downloader-bot/{__version__} "
+            "(+https://github.com/elt-onl/free-bandcamp-downloader)"
+        )
         retries = Retry(
             total=10, backoff_factor=10, backoff_max=60, allowed_methods={"POST", "GET"}
         )
@@ -432,8 +440,10 @@ class BCFreeDownloader:
         return ret
 
     def _request_email_download(self, tralbum_data: Dict):
+        # not the release's own host: a custom domain answers this POST with a
+        # 303 to the *.bandcamp.com page, which requests replays as a GET
         r = self.post_url_json(
-            urljoin(tralbum_data["url"], "/email_download"),
+            "https://bandcamp.com/email_download",
             data={
                 "encoding_name": "none",
                 "item_id": tralbum_data["current"]["id"],
